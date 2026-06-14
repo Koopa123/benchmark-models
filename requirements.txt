@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+torch
+torchvision
+transformers
+opencv-python
+ultralytics
+decord
+numpy
+pytorchvideo
+fvcore
+iopath
