@@ -8,6 +8,7 @@ opencv-python
 ultralytics
 decord
 numpy
-pytorchvideo
-fvcore
-iopath
+xgboost
+scikit-learn
+pandas
+joblib
