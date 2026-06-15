@@ -9,7 +9,7 @@ from ultralytics import YOLO
 from modelos.base import DetectorBase
 
 
-CLASES = {0: "SHOPLIFTING", 1: "Normal"}  # 0 = sospechoso, 1 = normal
+CLASES = {0: "SHOPLIFTING", 1: "Normal"}
 CONF_DETECCION_PERSONA = 0.5
 IOU_THRESHOLD = 0.3
 MAX_FRAMES_SIN_VER = 30
@@ -30,12 +30,6 @@ def iou(box1, box2):
 
 
 class PoseDetectorBase(DetectorBase):
-    """
-    Clase base para detectores YOLO Pose + clasificador.
-    Las subclases deben implementar:
-      - cargar_clasificador()
-      - predecir(keypoints_xy, keypoints_xyn) -> (clase_id, confianza)
-    """
 
     ruta_yolo_pose: str = "pesos/yolov8n-pose.pt"
 
@@ -54,12 +48,6 @@ class PoseDetectorBase(DetectorBase):
         raise NotImplementedError
 
     def predecir(self, keypoints_xy, keypoints_xyn):
-        """
-        Recibe:
-          - keypoints_xy: array (17, 2) coordenadas absolutas en píxeles
-          - keypoints_xyn: array (17, 2) coordenadas normalizadas a [0,1]
-        Devuelve (clase_id, confianza).
-        """
         raise NotImplementedError
 
     def procesar_video(self, ruta_video: str) -> Dict:
@@ -70,9 +58,15 @@ class PoseDetectorBase(DetectorBase):
         if not cap.isOpened():
             raise RuntimeError(f"No se pudo abrir el video: {ruta_video}")
 
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
         tracks_activos: List[Dict] = []
         tracks_cerrados: List[Dict] = []
         next_id = 1
+
+        # Predicciones frame-a-frame
+        # Para cada frame: lista de {bbox, clase, conf}
+        predicciones_por_frame: List[List[Dict]] = []
 
         frame_idx = 0
         tiempo_inicio = time.time()
@@ -84,16 +78,15 @@ class PoseDetectorBase(DetectorBase):
             frame_idx += 1
 
             results = self.yolo_pose(frame, verbose=False)
-
             detecciones_frame = []
+
             for r in results:
                 if r.keypoints is None or r.boxes is None:
                     continue
-
                 boxes = r.boxes.xyxy
                 confs = r.boxes.conf.tolist()
-                kpts_xy = r.keypoints.xy.cpu().numpy()      # absolutos
-                kpts_xyn = r.keypoints.xyn.cpu().numpy()    # normalizados [0,1]
+                kpts_xy = r.keypoints.xy.cpu().numpy()
+                kpts_xyn = r.keypoints.xyn.cpu().numpy()
 
                 for idx, box in enumerate(boxes):
                     if confs[idx] < CONF_DETECCION_PERSONA:
@@ -102,13 +95,8 @@ class PoseDetectorBase(DetectorBase):
                     bbox = [float(c) for c in box.tolist()]
 
                     try:
-                        clase_id, confianza = self.predecir(
-                            kpts_xy[idx],
-                            kpts_xyn[idx]
-                        )
-                    except Exception as e:
-                        # Si la predicción falla para un crop concreto, lo saltamos
-                        # (a veces los keypoints son malos y revienta el normalizado)
+                        clase_id, confianza = self.predecir(kpts_xy[idx], kpts_xyn[idx])
+                    except Exception:
                         continue
 
                     detecciones_frame.append({
@@ -116,6 +104,9 @@ class PoseDetectorBase(DetectorBase):
                         "clase": clase_id,
                         "conf": confianza,
                     })
+
+            # Guardar predicciones del frame
+            predicciones_por_frame.append(detecciones_frame)
 
             # Tracking por IoU
             ids_asignados = set()
@@ -137,14 +128,13 @@ class PoseDetectorBase(DetectorBase):
                     mejor_track["frames_sin_ver"] = 0
                     ids_asignados.add(mejor_track["id"])
                 else:
-                    nuevo = {
+                    tracks_activos.append({
                         "id": next_id,
                         "bbox": det["bbox"],
                         "votos": [det["clase"]],
                         "confianzas": [det["conf"]],
                         "frames_sin_ver": 0,
-                    }
-                    tracks_activos.append(nuevo)
+                    })
                     ids_asignados.add(next_id)
                     next_id += 1
 
@@ -160,18 +150,24 @@ class PoseDetectorBase(DetectorBase):
 
         cap.release()
         tiempo_total = time.time() - tiempo_inicio
-
         todos_los_tracks = tracks_activos + tracks_cerrados
-        return self._resultado_final(todos_los_tracks, frame_idx, tiempo_total)
 
-    def _resultado_final(self, tracks, frame_idx, tiempo_total):
+        return self._resultado_final(
+            todos_los_tracks,
+            predicciones_por_frame,
+            frame_idx,
+            tiempo_total,
+            fps_video
+        )
+
+    def _resultado_final(self, tracks, predicciones_por_frame, frame_idx, tiempo_total, fps_video):
+        # Resumen por persona (lo que ya teníamos)
         resultado_personas = []
         for t in tracks:
             if not t["votos"]:
                 continue
             contador = Counter(t["votos"])
             clase_ganadora = contador.most_common(1)[0][0]
-
             confianzas_ganadoras = [
                 c for v, c in zip(t["votos"], t["confianzas"])
                 if v == clase_ganadora
@@ -180,7 +176,6 @@ class PoseDetectorBase(DetectorBase):
                 sum(confianzas_ganadoras) / len(confianzas_ganadoras)
                 if confianzas_ganadoras else 0.0
             )
-
             resultado_personas.append({
                 "id": t["id"],
                 "prediccion": CLASES[clase_ganadora],
@@ -188,13 +183,24 @@ class PoseDetectorBase(DetectorBase):
                 "total_detecciones": len(t["votos"]),
             })
 
+        # Predicción por frame: si HAY al menos una detección con clase=0 (SHOPLIFTING),
+        # el frame se marca como SHOPLIFTING
+        prediccion_frames = []
+        for dets in predicciones_por_frame:
+            if any(d["clase"] == 0 for d in dets):
+                prediccion_frames.append("SHOPLIFTING")
+            else:
+                prediccion_frames.append("Normal")
+
         return {
             "nombre_modelo": self.nombre,
             "tiempo_total_s": round(tiempo_total, 2),
             "tiempo_por_frame_ms": round((tiempo_total * 1000) / max(frame_idx, 1), 2),
             "fps_efectivo": round(frame_idx / tiempo_total, 2) if tiempo_total > 0 else 0,
+            "fps_video": round(fps_video, 2),
             "total_frames": frame_idx,
             "personas_detectadas": resultado_personas,
+            "prediccion_frames": prediccion_frames,
         }
 
     def liberar(self):
@@ -203,29 +209,19 @@ class PoseDetectorBase(DetectorBase):
 
 
 # ============================================================
-# UTILIDADES DE FEATURES
+# UTILIDADES DE FEATURES (sin cambios)
 # ============================================================
 
 KEYPOINT_NAMES = [
-    "nose",
-    "left_eye", "right_eye",
-    "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder",
-    "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist",
-    "left_hip", "right_hip",
-    "left_knee", "right_knee",
-    "left_ankle", "right_ankle"
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle"
 ]
 KP = {name: i for i, name in enumerate(KEYPOINT_NAMES)}
 
 
 def normalize_pose_keypoints(keypoints_xy):
-    """
-    Normaliza los keypoints respecto al cuerpo.
-    Entrada: array (17, 2) en píxeles absolutos.
-    Salida: dict de features normalizadas (mismas que el notebook de entrenamiento).
-    """
     keypoints = np.asarray(keypoints_xy, dtype=float)
 
     left_shoulder = keypoints[KP["left_shoulder"]]
@@ -244,7 +240,6 @@ def normalize_pose_keypoints(keypoints_xy):
         scale = 1.0
 
     features = {}
-
     for i, name in enumerate(KEYPOINT_NAMES):
         x, y = keypoints[i]
         features[f"{name}_x_norm"] = (x - body_center[0]) / scale

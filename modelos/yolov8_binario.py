@@ -8,36 +8,27 @@ from ultralytics import YOLO
 from modelos.base import DetectorBase
 
 
-CLASES = {0: "Normal", 1: "SHOPLIFTING"}
+CLASES_NOMBRE = {0: "Normal", 1: "SHOPLIFTING"}
 CONF_DETECCION = 0.4
 IOU_THRESHOLD = 0.3
 MAX_FRAMES_SIN_VER = 30
 
 
 def iou(box1, box2):
-    """Calcula IoU entre dos cajas [x1,y1,x2,y2]."""
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
-
     if x2 < x1 or y2 < y1:
         return 0.0
-
     inter = (x2 - x1) * (y2 - y1)
     area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
     area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
     union = area1 + area2 - inter
-
     return inter / union if union > 0 else 0.0
 
 
 class YOLOv8BinarioDetector(DetectorBase):
-    """
-    Detector basado en fine-tuning de YOLOv8 con clases normal/robo.
-    El modelo predice directamente sobre el frame completo (como fue entrenado).
-    Las cajas se trackean por IoU para asignar IDs consistentes a lo largo del video.
-    """
 
     def __init__(self, nombre: str, ruta_pesos: str):
         self.nombre = nombre
@@ -57,9 +48,14 @@ class YOLOv8BinarioDetector(DetectorBase):
         if not cap.isOpened():
             raise RuntimeError(f"No se pudo abrir el video: {ruta_video}")
 
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
         tracks_activos: List[Dict] = []
         tracks_cerrados: List[Dict] = []
         next_id = 1
+
+        # Predicción por frame: "SHOPLIFTING" si detectó al menos una caja clase=1, sino "Normal"
+        prediccion_frames: List[str] = []
 
         frame_idx = 0
         tiempo_inicio = time.time()
@@ -70,19 +66,24 @@ class YOLOv8BinarioDetector(DetectorBase):
                 break
             frame_idx += 1
 
-            # Inferencia directa sobre el frame completo
             results = self.model.predict(frame, conf=CONF_DETECCION, verbose=False)
 
             detecciones_frame = []
+            hay_robo = False
             if results[0].boxes is not None:
                 for box in results[0].boxes:
+                    clase_id = int(box.cls[0])
+                    if clase_id == 1:
+                        hay_robo = True
                     detecciones_frame.append({
                         "bbox": [float(c) for c in box.xyxy[0]],
-                        "clase": int(box.cls[0]),
+                        "clase": clase_id,
                         "conf": float(box.conf[0]),
                     })
 
-            # Asociar detecciones del frame con tracks existentes por IoU
+            prediccion_frames.append("SHOPLIFTING" if hay_robo else "Normal")
+
+            # Tracking por IoU
             ids_asignados = set()
             for det in detecciones_frame:
                 mejor_iou = 0.0
@@ -96,26 +97,22 @@ class YOLOv8BinarioDetector(DetectorBase):
                         mejor_track = t
 
                 if mejor_track is not None:
-                    # Actualizar track existente
                     mejor_track["bbox"] = det["bbox"]
                     mejor_track["votos"].append(det["clase"])
                     mejor_track["confianzas"].append(det["conf"])
                     mejor_track["frames_sin_ver"] = 0
                     ids_asignados.add(mejor_track["id"])
                 else:
-                    # Crear track nuevo
-                    nuevo = {
+                    tracks_activos.append({
                         "id": next_id,
                         "bbox": det["bbox"],
                         "votos": [det["clase"]],
                         "confianzas": [det["conf"]],
                         "frames_sin_ver": 0,
-                    }
-                    tracks_activos.append(nuevo)
+                    })
                     ids_asignados.add(next_id)
                     next_id += 1
 
-            # Mover tracks viejos a cerrados
             sobreviven = []
             for t in tracks_activos:
                 if t["id"] not in ids_asignados:
@@ -128,20 +125,15 @@ class YOLOv8BinarioDetector(DetectorBase):
 
         cap.release()
         tiempo_total = time.time() - tiempo_inicio
+        todos = tracks_activos + tracks_cerrados
 
-        # Combinar todos los tracks
-        todos_los_tracks = tracks_activos + tracks_cerrados
-        return self._resultado_final(todos_los_tracks, frame_idx, tiempo_total)
-
-    def _resultado_final(self, tracks, frame_idx, tiempo_total):
+        # Resumen por persona
         resultado_personas = []
-        for t in tracks:
+        for t in todos:
             if not t["votos"]:
                 continue
-
             contador = Counter(t["votos"])
             clase_ganadora = contador.most_common(1)[0][0]
-
             confianzas_ganadoras = [
                 c for v, c in zip(t["votos"], t["confianzas"])
                 if v == clase_ganadora
@@ -150,10 +142,9 @@ class YOLOv8BinarioDetector(DetectorBase):
                 sum(confianzas_ganadoras) / len(confianzas_ganadoras)
                 if confianzas_ganadoras else 0.0
             )
-
             resultado_personas.append({
                 "id": t["id"],
-                "prediccion": CLASES[clase_ganadora],
+                "prediccion": CLASES_NOMBRE[clase_ganadora],
                 "confianza": round(confianza_prom * 100, 2),
                 "total_detecciones": len(t["votos"]),
             })
@@ -163,8 +154,10 @@ class YOLOv8BinarioDetector(DetectorBase):
             "tiempo_total_s": round(tiempo_total, 2),
             "tiempo_por_frame_ms": round((tiempo_total * 1000) / max(frame_idx, 1), 2),
             "fps_efectivo": round(frame_idx / tiempo_total, 2) if tiempo_total > 0 else 0,
+            "fps_video": round(fps_video, 2),
             "total_frames": frame_idx,
             "personas_detectadas": resultado_personas,
+            "prediccion_frames": prediccion_frames,
         }
 
     def liberar(self):

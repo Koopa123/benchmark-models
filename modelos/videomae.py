@@ -1,6 +1,6 @@
 import time
 from collections import deque
-from typing import Dict
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -83,10 +83,13 @@ class VideoMAEDetector(DetectorBase):
         if not cap.isOpened():
             raise RuntimeError(f"No se pudo abrir el video: {ruta_video}")
 
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         personas: Dict[int, PersonaTracker] = {}
+        prediccion_frames: List[str] = []
+
         frame_idx = 0
         tiempo_inicio = time.time()
 
@@ -97,28 +100,32 @@ class VideoMAEDetector(DetectorBase):
             frame_idx += 1
 
             results = self.yolo.track(frame, persist=True, classes=[0], verbose=False)
-            if results[0].boxes is None or results[0].boxes.id is None:
-                continue
+            hay_sospecha = False
 
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            ids = results[0].boxes.id.cpu().numpy().astype(int)
+            if results[0].boxes is not None and results[0].boxes.id is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                ids = results[0].boxes.id.cpu().numpy().astype(int)
 
-            for bbox, pid in zip(boxes, ids):
-                x1 = max(0, int(bbox[0]))
-                y1 = max(0, int(bbox[1]))
-                x2 = min(width, int(bbox[2]))
-                y2 = min(height, int(bbox[3]))
+                for bbox, pid in zip(boxes, ids):
+                    x1 = max(0, int(bbox[0]))
+                    y1 = max(0, int(bbox[1]))
+                    x2 = min(width, int(bbox[2]))
+                    y2 = min(height, int(bbox[3]))
+                    if x2 - x1 < 20 or y2 - y1 < 20:
+                        continue
 
-                if x2 - x1 < 20 or y2 - y1 < 20:
-                    continue
+                    if pid not in personas:
+                        personas[pid] = PersonaTracker(pid)
+                    personas[pid].agregar_frame(frame[y1:y2, x1:x2])
 
-                if pid not in personas:
-                    personas[pid] = PersonaTracker(pid)
+                    if personas[pid].listo_para_clasificar():
+                        personas[pid].clasificar(self.model, self.processor, self.device)
 
-                personas[pid].agregar_frame(frame[y1:y2, x1:x2])
+                    # Si alguna persona en este frame está marcada como SHOPLIFTING, el frame lo es
+                    if personas[pid].estado == "SHOPLIFTING":
+                        hay_sospecha = True
 
-                if personas[pid].listo_para_clasificar():
-                    personas[pid].clasificar(self.model, self.processor, self.device)
+            prediccion_frames.append("SHOPLIFTING" if hay_sospecha else "Normal")
 
         cap.release()
         tiempo_total = time.time() - tiempo_inicio
@@ -127,7 +134,7 @@ class VideoMAEDetector(DetectorBase):
         for pid, p in personas.items():
             resultado_personas.append({
                 "id": int(pid),
-                "prediccion": p.estado,
+                "prediccion": p.estado if p.estado != "Analizando" else "Normal",
                 "confianza": round(p.prob_shoplifting * 100, 2),
             })
 
@@ -136,8 +143,10 @@ class VideoMAEDetector(DetectorBase):
             "tiempo_total_s": round(tiempo_total, 2),
             "tiempo_por_frame_ms": round((tiempo_total * 1000) / max(frame_idx, 1), 2),
             "fps_efectivo": round(frame_idx / tiempo_total, 2) if tiempo_total > 0 else 0,
+            "fps_video": round(fps_video, 2),
             "total_frames": frame_idx,
             "personas_detectadas": resultado_personas,
+            "prediccion_frames": prediccion_frames,
         }
 
     def liberar(self):
