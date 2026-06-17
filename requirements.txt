@@ -12,3 +12,4 @@ xgboost
 scikit-learn
 pandas
 joblib
+lap>=0.5.12

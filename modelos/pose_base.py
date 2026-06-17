@@ -1,6 +1,6 @@
 import time
 from collections import Counter
-from typing import Dict, List
+from typing import Dict, List, Generator
 
 import cv2
 import numpy as np
@@ -13,6 +13,12 @@ CLASES = {0: "SHOPLIFTING", 1: "Normal"}
 CONF_DETECCION_PERSONA = 0.5
 IOU_THRESHOLD = 0.3
 MAX_FRAMES_SIN_VER = 30
+
+# Colores para dibujo (BGR porque es OpenCV)
+COLOR_NORMAL = (0, 200, 80)
+COLOR_SOSPECHOSO = (0, 50, 220)
+COLOR_HUD_BG = (30, 30, 30)
+COLOR_HUD_TEXT = (255, 255, 255)
 
 
 def iou(box1, box2):
@@ -29,6 +35,48 @@ def iou(box1, box2):
     return inter / union if union > 0 else 0.0
 
 
+def dibujar_hud(frame, nombre_modelo, frame_idx, total_frames, sospechosos):
+    """Dibuja un panel informativo arriba del frame."""
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 50), COLOR_HUD_BG, -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+    cv2.putText(frame, nombre_modelo, (12, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_HUD_TEXT, 2)
+
+    progreso = f"Frame {frame_idx} / {total_frames}" if total_frames > 0 else f"Frame {frame_idx}"
+    cv2.putText(frame, progreso, (12, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_HUD_TEXT, 1)
+
+    if sospechosos > 0:
+        texto = f"SOSPECHOSOS: {sospechosos}"
+        (tw, th), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.putText(frame, texto, (w - tw - 12, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 80, 255), 2)
+
+    return frame
+
+
+def dibujar_cajas(frame, detecciones):
+    """Dibuja las cajas y etiquetas de cada detección."""
+    for det in detecciones:
+        x1, y1, x2, y2 = [int(c) for c in det["bbox"]]
+        es_sospechoso = det["clase"] == 0  # 0 = SHOPLIFTING
+        color = COLOR_SOSPECHOSO if es_sospechoso else COLOR_NORMAL
+        label = "SOSPECHOSO" if es_sospechoso else "NORMAL"
+        conf = det.get("conf", 0)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        texto = f"{label} {conf * 100:.0f}%"
+        (text_w, text_h), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (x1, y1 - text_h - 8), (x1 + text_w + 10, y1), color, -1)
+        cv2.putText(frame, texto, (x1 + 5, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return frame
+
+
 class PoseDetectorBase(DetectorBase):
 
     ruta_yolo_pose: str = "pesos/yolov8n-pose.pt"
@@ -37,6 +85,9 @@ class PoseDetectorBase(DetectorBase):
         self.nombre = nombre
         self.yolo_pose = None
         self.clasificador = None
+        # Cache del último resultado para que el endpoint lo recupere
+        # después de que termine el stream
+        self.ultimo_resultado = None
 
     def cargar(self):
         print(f"[{self.nombre}] Cargando...")
@@ -50,6 +101,9 @@ class PoseDetectorBase(DetectorBase):
     def predecir(self, keypoints_xy, keypoints_xyn):
         raise NotImplementedError
 
+    # ============================================================
+    # PROCESAR VIDEO (modo "silencioso", igual a antes)
+    # ============================================================
     def procesar_video(self, ruta_video: str) -> Dict:
         if self.yolo_pose is None:
             self.cargar()
@@ -63,9 +117,6 @@ class PoseDetectorBase(DetectorBase):
         tracks_activos: List[Dict] = []
         tracks_cerrados: List[Dict] = []
         next_id = 1
-
-        # Predicciones frame-a-frame
-        # Para cada frame: lista de {bbox, clase, conf}
         predicciones_por_frame: List[List[Dict]] = []
 
         frame_idx = 0
@@ -77,76 +128,12 @@ class PoseDetectorBase(DetectorBase):
                 break
             frame_idx += 1
 
-            results = self.yolo_pose(frame, verbose=False)
-            detecciones_frame = []
-
-            for r in results:
-                if r.keypoints is None or r.boxes is None:
-                    continue
-                boxes = r.boxes.xyxy
-                confs = r.boxes.conf.tolist()
-                kpts_xy = r.keypoints.xy.cpu().numpy()
-                kpts_xyn = r.keypoints.xyn.cpu().numpy()
-
-                for idx, box in enumerate(boxes):
-                    if confs[idx] < CONF_DETECCION_PERSONA:
-                        continue
-
-                    bbox = [float(c) for c in box.tolist()]
-
-                    try:
-                        clase_id, confianza = self.predecir(kpts_xy[idx], kpts_xyn[idx])
-                    except Exception:
-                        continue
-
-                    detecciones_frame.append({
-                        "bbox": bbox,
-                        "clase": clase_id,
-                        "conf": confianza,
-                    })
-
-            # Guardar predicciones del frame
+            detecciones_frame = self._procesar_un_frame(frame)
             predicciones_por_frame.append(detecciones_frame)
 
-            # Tracking por IoU
-            ids_asignados = set()
-            for det in detecciones_frame:
-                mejor_iou = 0.0
-                mejor_track = None
-                for t in tracks_activos:
-                    if t["id"] in ids_asignados:
-                        continue
-                    iou_val = iou(det["bbox"], t["bbox"])
-                    if iou_val > mejor_iou and iou_val >= IOU_THRESHOLD:
-                        mejor_iou = iou_val
-                        mejor_track = t
-
-                if mejor_track is not None:
-                    mejor_track["bbox"] = det["bbox"]
-                    mejor_track["votos"].append(det["clase"])
-                    mejor_track["confianzas"].append(det["conf"])
-                    mejor_track["frames_sin_ver"] = 0
-                    ids_asignados.add(mejor_track["id"])
-                else:
-                    tracks_activos.append({
-                        "id": next_id,
-                        "bbox": det["bbox"],
-                        "votos": [det["clase"]],
-                        "confianzas": [det["conf"]],
-                        "frames_sin_ver": 0,
-                    })
-                    ids_asignados.add(next_id)
-                    next_id += 1
-
-            sobreviven = []
-            for t in tracks_activos:
-                if t["id"] not in ids_asignados:
-                    t["frames_sin_ver"] += 1
-                if t["frames_sin_ver"] >= MAX_FRAMES_SIN_VER:
-                    tracks_cerrados.append(t)
-                else:
-                    sobreviven.append(t)
-            tracks_activos = sobreviven
+            tracks_activos, tracks_cerrados, next_id = self._actualizar_tracks(
+                tracks_activos, tracks_cerrados, detecciones_frame, next_id
+            )
 
         cap.release()
         tiempo_total = time.time() - tiempo_inicio
@@ -160,8 +147,164 @@ class PoseDetectorBase(DetectorBase):
             fps_video
         )
 
+    # ============================================================
+    # PROCESAR VIDEO STREAMING (modo "visual", para mostrar en vivo)
+    # ============================================================
+    def procesar_video_streaming(self, ruta_video: str) -> Generator[bytes, None, None]:
+        """
+        Versión generador: procesa el video frame por frame y yieldea
+        cada frame procesado como bytes JPEG (multipart MJPEG).
+        Al terminar, guarda el resultado en self.ultimo_resultado.
+        """
+        if self.yolo_pose is None:
+            self.cargar()
+
+        cap = cv2.VideoCapture(ruta_video)
+        if not cap.isOpened():
+            raise RuntimeError(f"No se pudo abrir el video: {ruta_video}")
+
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        tracks_activos: List[Dict] = []
+        tracks_cerrados: List[Dict] = []
+        next_id = 1
+        predicciones_por_frame: List[List[Dict]] = []
+
+        frame_idx = 0
+        tiempo_inicio = time.time()
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
+
+                detecciones_frame = self._procesar_un_frame(frame)
+                predicciones_por_frame.append(detecciones_frame)
+
+                tracks_activos, tracks_cerrados, next_id = self._actualizar_tracks(
+                    tracks_activos, tracks_cerrados, detecciones_frame, next_id
+                )
+
+                # Dibujar cajas y HUD
+                sospechosos_frame = sum(1 for d in detecciones_frame if d["clase"] == 0)
+                frame = dibujar_cajas(frame, detecciones_frame)
+                frame = dibujar_hud(
+                    frame,
+                    self.nombre,
+                    frame_idx,
+                    total_frames_video,
+                    sospechosos_frame
+                )
+
+                # Encodear como JPEG
+                ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if not ok:
+                    continue
+
+                frame_bytes = buffer.tobytes()
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" +
+                    frame_bytes +
+                    b"\r\n"
+                )
+        finally:
+            cap.release()
+            tiempo_total = time.time() - tiempo_inicio
+            todos_los_tracks = tracks_activos + tracks_cerrados
+
+            # Guardar resultado para que el backend lo recupere después
+            self.ultimo_resultado = self._resultado_final(
+                todos_los_tracks,
+                predicciones_por_frame,
+                frame_idx,
+                tiempo_total,
+                fps_video
+            )
+            print(f"[{self.nombre}] Stream terminado: {frame_idx} frames en {tiempo_total:.1f}s")
+
+    # ============================================================
+    # HELPERS (lógica compartida entre los 2 modos)
+    # ============================================================
+    def _procesar_un_frame(self, frame) -> List[Dict]:
+        """Procesa un solo frame y devuelve las detecciones."""
+        results = self.yolo_pose(frame, verbose=False)
+        detecciones_frame = []
+
+        for r in results:
+            if r.keypoints is None or r.boxes is None:
+                continue
+            boxes = r.boxes.xyxy
+            confs = r.boxes.conf.tolist()
+            kpts_xy = r.keypoints.xy.cpu().numpy()
+            kpts_xyn = r.keypoints.xyn.cpu().numpy()
+
+            for idx, box in enumerate(boxes):
+                if confs[idx] < CONF_DETECCION_PERSONA:
+                    continue
+
+                bbox = [float(c) for c in box.tolist()]
+
+                try:
+                    clase_id, confianza = self.predecir(kpts_xy[idx], kpts_xyn[idx])
+                except Exception:
+                    continue
+
+                detecciones_frame.append({
+                    "bbox": bbox,
+                    "clase": clase_id,
+                    "conf": confianza,
+                })
+
+        return detecciones_frame
+
+    def _actualizar_tracks(self, tracks_activos, tracks_cerrados, detecciones_frame, next_id):
+        """Actualiza los tracks por IoU. Devuelve (activos, cerrados, next_id)."""
+        ids_asignados = set()
+
+        for det in detecciones_frame:
+            mejor_iou = 0.0
+            mejor_track = None
+            for t in tracks_activos:
+                if t["id"] in ids_asignados:
+                    continue
+                iou_val = iou(det["bbox"], t["bbox"])
+                if iou_val > mejor_iou and iou_val >= IOU_THRESHOLD:
+                    mejor_iou = iou_val
+                    mejor_track = t
+
+            if mejor_track is not None:
+                mejor_track["bbox"] = det["bbox"]
+                mejor_track["votos"].append(det["clase"])
+                mejor_track["confianzas"].append(det["conf"])
+                mejor_track["frames_sin_ver"] = 0
+                ids_asignados.add(mejor_track["id"])
+            else:
+                tracks_activos.append({
+                    "id": next_id,
+                    "bbox": det["bbox"],
+                    "votos": [det["clase"]],
+                    "confianzas": [det["conf"]],
+                    "frames_sin_ver": 0,
+                })
+                ids_asignados.add(next_id)
+                next_id += 1
+
+        sobreviven = []
+        for t in tracks_activos:
+            if t["id"] not in ids_asignados:
+                t["frames_sin_ver"] += 1
+            if t["frames_sin_ver"] >= MAX_FRAMES_SIN_VER:
+                tracks_cerrados.append(t)
+            else:
+                sobreviven.append(t)
+
+        return sobreviven, tracks_cerrados, next_id
+
     def _resultado_final(self, tracks, predicciones_por_frame, frame_idx, tiempo_total, fps_video):
-        # Resumen por persona (lo que ya teníamos)
         resultado_personas = []
         for t in tracks:
             if not t["votos"]:
@@ -183,8 +326,6 @@ class PoseDetectorBase(DetectorBase):
                 "total_detecciones": len(t["votos"]),
             })
 
-        # Predicción por frame: si HAY al menos una detección con clase=0 (SHOPLIFTING),
-        # el frame se marca como SHOPLIFTING
         prediccion_frames = []
         for dets in predicciones_por_frame:
             if any(d["clase"] == 0 for d in dets):
