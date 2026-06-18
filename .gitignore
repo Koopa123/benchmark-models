@@ -1,10 +1,10 @@
-venv/
-env/
-.venv/
 __pycache__/
-*.pyc
-pesos/
+bench/videos_demo/
+venv/
 videos_benchmark/
+pesos/
+.venv/
+*.pyc
 .env
 .env.local
 .vscode/

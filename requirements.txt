@@ -1,15 +1,32 @@
+# ============================================================
+# FastAPI / servidor
+# ============================================================
 fastapi
 uvicorn[standard]
 python-multipart
+pydantic
+websockets
+
+# ============================================================
+# Visión por computadora
+# ============================================================
+opencv-python-headless
+numpy
+ultralytics
+lap>=0.5.12              # requerido por yolo.track() en VideoMAE
+decord                   # requerido por VideoMAEImageProcessor
+
+# ============================================================
+# Deep learning (VideoMAE + Pose models)
+# ============================================================
 torch
 torchvision
 transformers
-opencv-python
-ultralytics
-decord
-numpy
+
+# ============================================================
+# Clasificadores clásicos (Pose + SVM / XGBoost)
+# ============================================================
 xgboost
 scikit-learn
-pandas
 joblib
-lap>=0.5.12
+pandas
