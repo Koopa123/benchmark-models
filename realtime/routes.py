@@ -23,6 +23,7 @@ import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from vision_core.modelos.pose_xgb_booster import PoseXGBBoosterDetector
+from vision_core.modelos.aglomeracion import AglomeracionDetector
 
 
 # ============================================================
@@ -33,14 +34,11 @@ from vision_core.modelos.pose_xgb_booster import PoseXGBBoosterDetector
 # Si después quieres agregar "aglomeraciones", inicializa aquí su detector también.
 
 _detector_sospechosa: Optional[PoseXGBBoosterDetector] = None
+_detector_aglomeraciones: Optional[AglomeracionDetector] = None
 
 
 def get_detector(modo: str):
-    """
-    Devuelve el detector correspondiente al modo.
-    Lo carga en memoria la primera vez que se pide.
-    """
-    global _detector_sospechosa
+    global _detector_sospechosa, _detector_aglomeraciones
 
     if modo == "sospechosa":
         if _detector_sospechosa is None:
@@ -49,11 +47,14 @@ def get_detector(modo: str):
             _detector_sospechosa.cargar()
         return _detector_sospechosa
 
-    # TODO: cuando agregues aglomeraciones:
-    # elif modo == "aglomeraciones":
-    #     ...
+    elif modo == "aglomeraciones":
+        if _detector_aglomeraciones is None:
+            print("[Realtime] Inicializando detector de aglomeraciones...")
+            _detector_aglomeraciones = AglomeracionDetector()
+            _detector_aglomeraciones.cargar()
+        return _detector_aglomeraciones
 
-    raise ValueError(f"Modo desconocido: '{modo}'. Modos válidos: 'sospechosa'")
+    raise ValueError(f"Modo desconocido: '{modo}'. Modos válidos: 'sospechosa', 'aglomeraciones'")
 
 
 # ============================================================
@@ -83,7 +84,7 @@ def listar_modos():
                 "id": "aglomeraciones",
                 "nombre": "Aglomeraciones",
                 "descripcion": "Detecta y cuenta personas para identificar aglomeraciones",
-                "disponible": False,  # cambiar a True cuando lo implementes
+                "disponible": True,
             },
         ]
     }
@@ -148,11 +149,17 @@ async def realtime_ws(websocket: WebSocket, modo: str = "sospechosa"):
                 )
             tiempo_anterior = ahora
 
-            # Procesar el frame con el detector
+            # Procesar el frame con el detector según el modo
             try:
-                frame_anotado, detecciones = detector.procesar_frame_realtime(
-                    frame, fps_actual=fps_suavizado
-                )
+                if modo == "aglomeraciones":
+                    frame_anotado, detecciones, stats = detector.procesar_frame_realtime(
+                        frame, fps_actual=fps_suavizado
+                    )
+                else:  # sospechosa
+                    frame_anotado, detecciones = detector.procesar_frame_realtime(
+                        frame, fps_actual=fps_suavizado
+                    )
+                    stats = None
             except Exception as e:
                 print(f"[Realtime] Error procesando frame: {e}")
                 await websocket.send_json({"error": f"Error procesando: {str(e)}"})
@@ -166,25 +173,37 @@ async def realtime_ws(websocket: WebSocket, modo: str = "sospechosa"):
 
             frame_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
 
-            # Resumen de detecciones para el frontend
-            sospechosos = sum(1 for d in detecciones if d.get("es_sospechoso"))
-
-            # Enviar respuesta
-            await websocket.send_json({
+            # Armar la respuesta según el modo
+            respuesta = {
+                "modo": modo,
                 "frame_jpeg_base64": frame_b64,
-                "detecciones": [
-                    {
-                        "bbox": d["bbox"],
-                        "clase": d["clase"],
-                        "conf": d["conf"],
-                        "es_sospechoso": d["es_sospechoso"],
-                    }
-                    for d in detecciones
-                ],
-                "total_personas": len(detecciones),
-                "sospechosos": sospechosos,
                 "fps": round(fps_suavizado, 1),
-            })
+            }
+
+            if modo == "aglomeraciones":
+                respuesta.update({
+                    "total_personas": stats["total_personas"],
+                    "grupo_mayor": stats["grupo_mayor"],
+                    "nivel": stats["nivel"],
+                    "detecciones": detecciones,
+                })
+            else:  # sospechosa
+                sospechosos = sum(1 for d in detecciones if d.get("es_sospechoso"))
+                respuesta.update({
+                    "total_personas": len(detecciones),
+                    "sospechosos": sospechosos,
+                    "detecciones": [
+                        {
+                            "bbox": d["bbox"],
+                            "clase": d["clase"],
+                            "conf": d["conf"],
+                            "es_sospechoso": d["es_sospechoso"],
+                        }
+                        for d in detecciones
+                    ],
+                })
+
+            await websocket.send_json(respuesta)
 
     except WebSocketDisconnect:
         print(f"[Realtime] Cliente desconectado (modo '{modo}')")
