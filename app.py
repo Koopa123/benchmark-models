@@ -8,6 +8,24 @@ Rutas:
     /bench/*       → comparación de modelos contra videos
     /realtime/ws   → WebSocket de detección en vivo desde webcam del cliente
 """
+import os
+import torch
+import cv2
+
+# ============================================================
+# CONFIGURACIÓN DE THREADS
+# ============================================================
+# Dejamos 1 núcleo libre para el sistema operativo, uvicorn,
+# nginx, fail2ban, etc. El resto se lo damos a torch/cv2 para
+# acelerar la inferencia de los modelos.
+NUM_CORES_TOTAL = os.cpu_count() or 6
+NUM_CORES_MODELOS = max(NUM_CORES_TOTAL - 1, 1)
+
+torch.set_num_threads(NUM_CORES_MODELOS)
+cv2.setNumThreads(NUM_CORES_MODELOS)
+
+print(f"[Config] CPU total: {NUM_CORES_TOTAL} núcleos | Asignados a modelos: {NUM_CORES_MODELOS}")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
