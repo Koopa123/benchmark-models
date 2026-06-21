@@ -191,6 +191,10 @@ class PoseDetectorBase(DetectorBase):
 
         fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Tiempo objetivo entre frames para reproducir al ritmo del video
+        # (ej: 30 FPS → 0.0333s por frame). Sin esto, con GPU rápida el
+        # video pasa "fast forward" y no se aprecia la detección.
+        frame_duracion_objetivo = 1.0 / fps_video if fps_video > 0 else 0.0
 
         tracks_activos: List[Dict] = []
         tracks_cerrados: List[Dict] = []
@@ -202,6 +206,7 @@ class PoseDetectorBase(DetectorBase):
 
         try:
             while True:
+                inicio_frame = time.time()
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -235,6 +240,14 @@ class PoseDetectorBase(DetectorBase):
                     frame_bytes +
                     b"\r\n"
                 )
+
+                # Mantener el ritmo del video original.
+                # Si el procesado fue más rápido que 1/fps_video, dormimos
+                # el tiempo restante. Si fue más lento, seguimos sin esperar.
+                tiempo_usado = time.time() - inicio_frame
+                sleep_restante = frame_duracion_objetivo - tiempo_usado
+                if sleep_restante > 0:
+                    time.sleep(sleep_restante)
         finally:
             cap.release()
             tiempo_total = time.time() - tiempo_inicio
@@ -264,7 +277,13 @@ class PoseDetectorBase(DetectorBase):
         if self.yolo_pose is None:
             self.cargar()
 
-        detecciones = self._procesar_un_frame(frame, imgsz=320)
+        # IMPORTANTE: usábamos imgsz=320 en CPU para ir más rápido, pero a esa
+        # resolución los keypoints quedan muy pegados y los modelos que
+        # dependen de normalize_pose_keypoints (SVM, XGB-Norm) generan features
+        # mal escaladas, lo que produce predicciones triviales (todo "Normal")
+        # y por eso visualmente parecía que "no detectaban nada".
+        # En GPU (RTX 4090) imgsz=640 corre igual de rápido y da features sanas.
+        detecciones = self._procesar_un_frame(frame, imgsz=640)
 
 
         # Enriquecer detecciones con flag es_sospechoso para el frontend
@@ -307,7 +326,13 @@ class PoseDetectorBase(DetectorBase):
 
                 try:
                     clase_id, confianza = self.predecir(kpts_xy[idx], kpts_xyn[idx])
-                except Exception:
+                except Exception as e:
+                    # Antes este except silenciaba TODO error en silencio,
+                    # lo que ocultaba bugs de SVM/XGB-Norm. Ahora al menos
+                    # imprime el error la primera vez para poder diagnosticar.
+                    if not getattr(self, "_error_predecir_mostrado", False):
+                        print(f"[{self.nombre}] WARN error en predecir(): {e}")
+                        self._error_predecir_mostrado = True
                     continue
 
                 detecciones_frame.append({
