@@ -335,6 +335,10 @@ class PoseDetectorBase(DetectorBase):
                         self._error_predecir_mostrado = True
                     continue
 
+                # --- DEBUG TEMPORAL: borrar después de diagnosticar ---
+                print(f"[{self.nombre}] DETECCION -> clase={clase_id} conf={confianza:.3f} bbox={bbox}")
+                # --- FIN DEBUG TEMPORAL ---
+
                 detecciones_frame.append({
                     "bbox": bbox,
                     "clase": clase_id,
