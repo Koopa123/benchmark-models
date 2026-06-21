@@ -27,6 +27,6 @@ transformers
 # Clasificadores clásicos (Pose + SVM / XGBoost)
 # ============================================================
 xgboost
-scikit-learn
+scikit-learn==1.7.2
 joblib
 pandas
