@@ -7,6 +7,7 @@ Reusa la lógica del backend principal pero simplificada:
 - Usa YOLOv8n (más rápido) en vez de YOLOv8s (más preciso)
 """
 import math
+import threading
 from typing import Dict, List, Tuple
 
 import cv2
@@ -49,6 +50,9 @@ class AglomeracionDetector:
 
     def __init__(self):
         self.yolo = None
+        # self.yolo es un singleton compartido entre todos los clientes de
+        # realtime: este lock serializa el acceso a la inferencia.
+        self._lock = threading.Lock()
 
     def cargar(self):
         print(f"[{self.nombre}] Cargando...")
@@ -69,7 +73,9 @@ class AglomeracionDetector:
             - nivel: "BAJO" | "MEDIO" | "ALTO"
         """
         if self.yolo is None:
-            self.cargar()
+            with self._lock:
+                if self.yolo is None:
+                    self.cargar()
 
         personas = self._detectar_personas(frame)
         distancia_umbral = self._calcular_distancia_adaptativa(personas)
@@ -105,7 +111,8 @@ class AglomeracionDetector:
     def _detectar_personas(self, frame) -> List[Dict]:
         # imgsz=480 acelera mucho la inferencia en CPU
         # (a costa de un poco de precisión, pero para realtime conviene)
-        resultados = self.yolo(frame, imgsz=480, verbose=False)
+        with self._lock:
+            resultados = self.yolo(frame, imgsz=480, verbose=False)
         personas = []
 
         for resultado in resultados:

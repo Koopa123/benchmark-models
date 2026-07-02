@@ -1,3 +1,4 @@
+import threading
 import time
 from collections import deque
 from typing import Dict, List
@@ -66,6 +67,9 @@ class VideoMAEDetector(DetectorBase):
         self.model = None
         self.processor = None
         self.yolo = None
+        # self.yolo/self.model son singletons compartidos entre sesiones
+        # concurrentes: este lock serializa el acceso a la inferencia.
+        self._lock = threading.Lock()
 
     def cargar(self):
         print(f"[{self.nombre}] Cargando en {self.device}...")
@@ -78,8 +82,18 @@ class VideoMAEDetector(DetectorBase):
         print(f"[{self.nombre}] Listo.")
 
     def procesar_video(self, ruta_video: str) -> Dict:
-        if self.model is None:
-            self.cargar()
+        with self._lock:
+            if self.model is None:
+                self.cargar()
+
+            # self.yolo se reusa entre videos (es un singleton compartido),
+            # pero su tracker interno (persist=True) arrastra IDs y estado
+            # de Kalman del video anterior si no se resetea aquí.
+            if getattr(self.yolo, "predictor", None) is not None:
+                try:
+                    self.yolo.predictor.trackers[0].reset()
+                except (AttributeError, IndexError):
+                    self.yolo.predictor = None
 
         cap = cv2.VideoCapture(ruta_video)
         if not cap.isOpened():
@@ -95,40 +109,43 @@ class VideoMAEDetector(DetectorBase):
         frame_idx = 0
         tiempo_inicio = time.time()
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
 
-            results = self.yolo.track(frame, persist=True, classes=[0], verbose=False)
-            hay_sospecha = False
+                with self._lock:
+                    results = self.yolo.track(frame, persist=True, classes=[0], verbose=False)
+                    hay_sospecha = False
 
-            if results[0].boxes is not None and results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                ids = results[0].boxes.id.cpu().numpy().astype(int)
+                    if results[0].boxes is not None and results[0].boxes.id is not None:
+                        boxes = results[0].boxes.xyxy.cpu().numpy()
+                        ids = results[0].boxes.id.cpu().numpy().astype(int)
 
-                for bbox, pid in zip(boxes, ids):
-                    x1 = max(0, int(bbox[0]))
-                    y1 = max(0, int(bbox[1]))
-                    x2 = min(width, int(bbox[2]))
-                    y2 = min(height, int(bbox[3]))
-                    if x2 - x1 < 20 or y2 - y1 < 20:
-                        continue
+                        for bbox, pid in zip(boxes, ids):
+                            x1 = max(0, int(bbox[0]))
+                            y1 = max(0, int(bbox[1]))
+                            x2 = min(width, int(bbox[2]))
+                            y2 = min(height, int(bbox[3]))
+                            if x2 - x1 < 20 or y2 - y1 < 20:
+                                continue
 
-                    if pid not in personas:
-                        personas[pid] = PersonaTracker(pid)
-                    personas[pid].agregar_frame(frame[y1:y2, x1:x2])
+                            if pid not in personas:
+                                personas[pid] = PersonaTracker(pid)
+                            personas[pid].agregar_frame(frame[y1:y2, x1:x2])
 
-                    if personas[pid].listo_para_clasificar():
-                        personas[pid].clasificar(self.model, self.processor, self.device)
+                            if personas[pid].listo_para_clasificar():
+                                personas[pid].clasificar(self.model, self.processor, self.device)
 
-                    if personas[pid].estado == "SHOPLIFTING":
-                        hay_sospecha = True
+                            if personas[pid].estado == "SHOPLIFTING":
+                                hay_sospecha = True
 
-            prediccion_frames.append("SHOPLIFTING" if hay_sospecha else "Normal")
+                prediccion_frames.append("SHOPLIFTING" if hay_sospecha else "Normal")
+        finally:
+            cap.release()
 
-        cap.release()
         tiempo_total = time.time() - tiempo_inicio
 
         resultado_personas = []

@@ -22,8 +22,9 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 
+from auth import requerir_auth, verificar_token
 from vision_core.modelos.pose_xgb_booster import PoseXGBBoosterDetector
 from vision_core.modelos.aglomeracion import AglomeracionDetector
 
@@ -81,7 +82,7 @@ def inicio():
 
 
 @router.get("/modos")
-def listar_modos():
+def listar_modos(_: dict = Depends(requerir_auth)):
     """Modos disponibles para que el frontend los muestre."""
     return {
         "modos": [
@@ -106,11 +107,13 @@ def listar_modos():
 # ============================================================
 
 @router.websocket("/ws")
-async def realtime_ws(websocket: WebSocket, modo: str = "sospechosa"):
+async def realtime_ws(websocket: WebSocket, token: str, modo: str = "sospechosa"):
     """
     WebSocket para detección en tiempo real.
 
     Query params:
+        token: JWT del login (el navegador no puede mandar el header
+               Authorization en el handshake de un WebSocket).
         modo: "sospechosa" o "aglomeraciones"
 
     Protocolo:
@@ -119,6 +122,11 @@ async def realtime_ws(websocket: WebSocket, modo: str = "sospechosa"):
 
     Para cambiar de modo: cerrar y reabrir el WebSocket con otro query param.
     """
+    try:
+        verificar_token(token)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
 
     await websocket.accept()
 
@@ -170,15 +178,20 @@ async def realtime_ws(websocket: WebSocket, modo: str = "sospechosa"):
 
             fps_mostrado = min(fps_suavizado, TARGET_FPS)
 
-            # Procesar el frame con el detector según el modo
+            # Procesar el frame con el detector según el modo.
+            # La inferencia es CPU/GPU-bound y bloqueante: la corremos en un
+            # thread aparte para no congelar el event loop (y con él, a
+            # todos los demás clientes conectados al mismo tiempo).
             try:
                 if modo == "aglomeraciones":
-                    frame_anotado, detecciones, stats = detector.procesar_frame_realtime(
+                    frame_anotado, detecciones, stats = await asyncio.to_thread(
+                        detector.procesar_frame_realtime,
                         frame,
                         fps_actual=fps_mostrado
                     )
                 else:
-                    frame_anotado, detecciones = detector.procesar_frame_realtime(
+                    frame_anotado, detecciones = await asyncio.to_thread(
+                        detector.procesar_frame_realtime,
                         frame,
                         fps_actual=fps_mostrado
                     )

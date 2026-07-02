@@ -1,6 +1,7 @@
+import threading
 import time
 from collections import Counter
-from typing import Dict, List, Generator, Tuple
+from typing import Dict, List, Generator, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -111,9 +112,11 @@ class PoseDetectorBase(DetectorBase):
         self.nombre = nombre
         self.yolo_pose = None
         self.clasificador = None
-        # Cache del último resultado para que el endpoint lo recupere
-        # después de que termine el stream
-        self.ultimo_resultado = None
+        # El modelo/clasificador es un singleton compartido entre todas las
+        # sesiones/usuarios concurrentes: este lock serializa el acceso a
+        # la inferencia para evitar corrupción de estado interno de
+        # ultralytics/xgboost/sklearn cuando dos requests caen a la vez.
+        self._lock = threading.Lock()
 
     def cargar(self):
         print(f"[{self.nombre}] Cargando...")
@@ -127,12 +130,18 @@ class PoseDetectorBase(DetectorBase):
     def predecir(self, keypoints_xy, keypoints_xyn):
         raise NotImplementedError
 
+    def _asegurar_cargado(self):
+        """Carga el modelo de forma perezosa y segura ante llamadas concurrentes."""
+        if self.yolo_pose is None:
+            with self._lock:
+                if self.yolo_pose is None:
+                    self.cargar()
+
     # ============================================================
     # PROCESAR VIDEO (modo "silencioso", igual a antes)
     # ============================================================
     def procesar_video(self, ruta_video: str) -> Dict:
-        if self.yolo_pose is None:
-            self.cargar()
+        self._asegurar_cargado()
 
         cap = cv2.VideoCapture(ruta_video)
         if not cap.isOpened():
@@ -148,20 +157,22 @@ class PoseDetectorBase(DetectorBase):
         frame_idx = 0
         tiempo_inicio = time.time()
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
 
-            detecciones_frame = self._procesar_un_frame(frame)
-            predicciones_por_frame.append(detecciones_frame)
+                detecciones_frame = self._procesar_un_frame(frame)
+                predicciones_por_frame.append(detecciones_frame)
 
-            tracks_activos, tracks_cerrados, next_id = self._actualizar_tracks(
-                tracks_activos, tracks_cerrados, detecciones_frame, next_id
-            )
+                tracks_activos, tracks_cerrados, next_id = self._actualizar_tracks(
+                    tracks_activos, tracks_cerrados, detecciones_frame, next_id
+                )
+        finally:
+            cap.release()
 
-        cap.release()
         tiempo_total = time.time() - tiempo_inicio
         todos_los_tracks = tracks_activos + tracks_cerrados
 
@@ -176,14 +187,15 @@ class PoseDetectorBase(DetectorBase):
     # ============================================================
     # PROCESAR VIDEO STREAMING (modo "visual" para benchmark)
     # ============================================================
-    def procesar_video_streaming(self, ruta_video: str) -> Generator[bytes, None, None]:
+    def procesar_video_streaming(self, ruta_video: str, resultado_out: Optional[dict] = None) -> Generator[bytes, None, None]:
         """
         Versión generador: procesa el video frame por frame y yieldea
         cada frame procesado como bytes JPEG (multipart MJPEG).
-        Al terminar, guarda el resultado en self.ultimo_resultado.
+        Al terminar, guarda el resultado final en resultado_out["valor"]
+        (un dict mutable que el caller controla, para no depender de un
+        atributo compartido del detector entre sesiones concurrentes).
         """
-        if self.yolo_pose is None:
-            self.cargar()
+        self._asegurar_cargado()
 
         cap = cv2.VideoCapture(ruta_video)
         if not cap.isOpened():
@@ -253,13 +265,15 @@ class PoseDetectorBase(DetectorBase):
             tiempo_total = time.time() - tiempo_inicio
             todos_los_tracks = tracks_activos + tracks_cerrados
 
-            self.ultimo_resultado = self._resultado_final(
+            resultado = self._resultado_final(
                 todos_los_tracks,
                 predicciones_por_frame,
                 frame_idx,
                 tiempo_total,
                 fps_video
             )
+            if resultado_out is not None:
+                resultado_out["valor"] = resultado
             print(f"[{self.nombre}] Stream terminado: {frame_idx} frames en {tiempo_total:.1f}s")
 
     # ============================================================
@@ -274,8 +288,7 @@ class PoseDetectorBase(DetectorBase):
             (frame_anotado, lista_detecciones)
             lista_detecciones: [{"bbox": [x1,y1,x2,y2], "clase": 0|1, "conf": float, "es_sospechoso": bool}, ...]
         """
-        if self.yolo_pose is None:
-            self.cargar()
+        self._asegurar_cargado()
 
         # IMPORTANTE: usábamos imgsz=320 en CPU para ir más rápido, pero a esa
         # resolución los keypoints quedan muy pegados y los modelos que
@@ -307,43 +320,45 @@ class PoseDetectorBase(DetectorBase):
         kwargs = {"verbose": False}
         if imgsz is not None:
             kwargs["imgsz"] = imgsz
-        results = self.yolo_pose(frame, **kwargs)
+
         detecciones_frame = []
 
-        for r in results:
-            if r.keypoints is None or r.boxes is None:
-                continue
-            boxes = r.boxes.xyxy
-            confs = r.boxes.conf.tolist()
-            kpts_xy = r.keypoints.xy.cpu().numpy()
-            kpts_xyn = r.keypoints.xyn.cpu().numpy()
+        # self.yolo_pose/self.clasificador son compartidos entre todas las
+        # sesiones concurrentes que usan este mismo modelo: serializamos
+        # para que dos requests no pisen el estado interno del modelo.
+        with self._lock:
+            results = self.yolo_pose(frame, **kwargs)
 
-            for idx, box in enumerate(boxes):
-                if confs[idx] < CONF_DETECCION_PERSONA:
+            for r in results:
+                if r.keypoints is None or r.boxes is None:
                     continue
+                boxes = r.boxes.xyxy
+                confs = r.boxes.conf.tolist()
+                kpts_xy = r.keypoints.xy.cpu().numpy()
+                kpts_xyn = r.keypoints.xyn.cpu().numpy()
 
-                bbox = [float(c) for c in box.tolist()]
+                for idx, box in enumerate(boxes):
+                    if confs[idx] < CONF_DETECCION_PERSONA:
+                        continue
 
-                try:
-                    clase_id, confianza = self.predecir(kpts_xy[idx], kpts_xyn[idx])
-                except Exception as e:
-                    # Antes este except silenciaba TODO error en silencio,
-                    # lo que ocultaba bugs de SVM/XGB-Norm. Ahora al menos
-                    # imprime el error la primera vez para poder diagnosticar.
-                    if not getattr(self, "_error_predecir_mostrado", False):
-                        print(f"[{self.nombre}] WARN error en predecir(): {e}")
-                        self._error_predecir_mostrado = True
-                    continue
+                    bbox = [float(c) for c in box.tolist()]
 
-                # --- DEBUG TEMPORAL: borrar después de diagnosticar ---
-                print(f"[{self.nombre}] DETECCION -> clase={clase_id} conf={confianza:.3f} bbox={bbox}")
-                # --- FIN DEBUG TEMPORAL ---
+                    try:
+                        clase_id, confianza = self.predecir(kpts_xy[idx], kpts_xyn[idx])
+                    except Exception as e:
+                        # Antes este except silenciaba TODO error en silencio,
+                        # lo que ocultaba bugs de SVM/XGB-Norm. Ahora al menos
+                        # imprime el error la primera vez para poder diagnosticar.
+                        if not getattr(self, "_error_predecir_mostrado", False):
+                            print(f"[{self.nombre}] WARN error en predecir(): {e}")
+                            self._error_predecir_mostrado = True
+                        continue
 
-                detecciones_frame.append({
-                    "bbox": bbox,
-                    "clase": clase_id,
-                    "conf": confianza,
-                })
+                    detecciones_frame.append({
+                        "bbox": bbox,
+                        "clase": clase_id,
+                        "conf": confianza,
+                    })
 
         return detecciones_frame
 

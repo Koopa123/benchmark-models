@@ -14,10 +14,11 @@ import time
 from pathlib import Path
 from typing import List, Dict, Tuple
 
-from fastapi import APIRouter, File, UploadFile, HTTPException
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from auth import requerir_auth
 from vision_core.modelos.videomae import VideoMAEDetector
 from vision_core.modelos.yolov8_binario import YOLOv8BinarioDetector
 from vision_core.modelos.pose_xgb_booster import PoseXGBBoosterDetector
@@ -82,6 +83,13 @@ MODELOS_VISUALES = {
 # Sesiones activas: { session_id: {"ruta": str, "nombre_original": str, "es_demo": bool} }
 SESIONES = {}
 
+# Resultados de streams visuales en curso/terminados, aislados por sesión
+# (antes se guardaban en detector.ultimo_resultado, un atributo compartido
+# por TODAS las sesiones que usaran el mismo modelo, lo que hacía que dos
+# usuarios corriendo el mismo modelo a la vez se pisaran los resultados).
+# Forma: { session_id: {"valor": Dict | None} }
+RESULTADOS_STREAM: Dict[str, Dict] = {}
+
 
 @router.get("/")
 def inicio():
@@ -92,7 +100,7 @@ def inicio():
 
 
 @router.get("/modelos")
-def listar_modelos():
+def listar_modelos(_: dict = Depends(requerir_auth)):
     return {
         "modelos": [
             {"id": mid, "nombre": m.nombre}
@@ -118,7 +126,7 @@ def _cargar_meta_demos() -> List[Dict]:
 
 
 @router.get("/videos-demo")
-def listar_videos_demo():
+def listar_videos_demo(_: dict = Depends(requerir_auth)):
     """Lista los videos demo disponibles con sus metadatos."""
     demos = _cargar_meta_demos()
     disponibles = []
@@ -138,7 +146,7 @@ def listar_videos_demo():
 
 
 @router.get("/sesion-preview-demo")
-def preview_demo(demo_id: str):
+def preview_demo(demo_id: str, _: dict = Depends(requerir_auth)):
     """Devuelve el archivo de video de un demo para hacer preview en el frontend."""
     demos = _cargar_meta_demos()
     demo = next((d for d in demos if d["id"] == demo_id), None)
@@ -157,10 +165,11 @@ def preview_demo(demo_id: str):
 # ============================================================
 
 @router.post("/sesion/iniciar")
-async def iniciar_sesion(file: UploadFile = File(...)):
+async def iniciar_sesion(file: UploadFile = File(...), _: dict = Depends(requerir_auth)):
     """Sube un video y crea una sesión nueva."""
     session_id = str(uuid.uuid4())
-    nombre_archivo = f"{session_id}_{file.filename}"
+    nombre_seguro = Path(file.filename).name  # evita path traversal (../, rutas absolutas)
+    nombre_archivo = f"{session_id}_{nombre_seguro}"
     ruta_video = CARPETA_VIDEOS / nombre_archivo
 
     with open(ruta_video, "wb") as buffer:
@@ -180,7 +189,7 @@ async def iniciar_sesion(file: UploadFile = File(...)):
 
 
 @router.post("/sesion/iniciar-demo")
-def iniciar_sesion_demo(request: IniciarDemoRequest):
+def iniciar_sesion_demo(request: IniciarDemoRequest, _: dict = Depends(requerir_auth)):
     """
     Crea una sesión usando un video demo pre-cargado.
     No requiere subir nada — usa el archivo que ya existe en videos_demo/.
@@ -212,7 +221,7 @@ def iniciar_sesion_demo(request: IniciarDemoRequest):
 
 
 @router.get("/sesion/{session_id}/video")
-def obtener_video(session_id: str):
+def obtener_video(session_id: str, _: dict = Depends(requerir_auth)):
     if session_id not in SESIONES:
         raise HTTPException(404, "Sesión no encontrada")
 
@@ -256,7 +265,7 @@ def agregar_metricas_a_resultado(resultado: Dict, intervalos_robo: List[Interval
 
 
 @router.post("/sesion/{session_id}/correr/{nombre_modelo}")
-def correr_modelo(session_id: str, nombre_modelo: str, request: CorrerModeloRequest):
+def correr_modelo(session_id: str, nombre_modelo: str, request: CorrerModeloRequest, _: dict = Depends(requerir_auth)):
     if session_id not in SESIONES:
         raise HTTPException(404, "Sesión no encontrada")
 
@@ -278,7 +287,7 @@ def correr_modelo(session_id: str, nombre_modelo: str, request: CorrerModeloRequ
 
 
 @router.get("/sesion/{session_id}/stream/{nombre_modelo}")
-def stream_modelo_visual(session_id: str, nombre_modelo: str):
+def stream_modelo_visual(session_id: str, nombre_modelo: str, _: dict = Depends(requerir_auth)):
     """
     Devuelve un stream MJPEG con bounding boxes, etiquetas y HUD.
     Solo se usa para los 3 modelos Pose seleccionados.
@@ -307,16 +316,17 @@ def stream_modelo_visual(session_id: str, nombre_modelo: str):
             f"El modelo '{nombre_modelo}' no soporta streaming visual"
         )
 
-    detector.ultimo_resultado = None
+    resultado_out = {"valor": None}
+    RESULTADOS_STREAM[session_id] = resultado_out
 
     return StreamingResponse(
-        detector.procesar_video_streaming(ruta_video),
+        detector.procesar_video_streaming(ruta_video, resultado_out=resultado_out),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
 
 @router.post("/sesion/{session_id}/resultado-stream/{nombre_modelo}")
-def obtener_resultado_stream(session_id: str, nombre_modelo: str, request: CorrerModeloRequest):
+def obtener_resultado_stream(session_id: str, nombre_modelo: str, request: CorrerModeloRequest, _: dict = Depends(requerir_auth)):
     """
     El frontend consulta este endpoint mientras el stream está procesando.
     Cuando el stream termina, devuelve las métricas finales.
@@ -333,8 +343,8 @@ def obtener_resultado_stream(session_id: str, nombre_modelo: str, request: Corre
             f"El modelo '{nombre_modelo}' no tiene resultado visual habilitado"
         )
 
-    detector = MODELOS_DISPONIBLES[nombre_modelo]
-    resultado = getattr(detector, "ultimo_resultado", None)
+    resultado_out = RESULTADOS_STREAM.get(session_id)
+    resultado = resultado_out["valor"] if resultado_out else None
 
     if resultado is None:
         return JSONResponse(
@@ -348,7 +358,7 @@ def obtener_resultado_stream(session_id: str, nombre_modelo: str, request: Corre
 
 
 @router.delete("/sesion/{session_id}")
-def cerrar_sesion(session_id: str):
+def cerrar_sesion(session_id: str, _: dict = Depends(requerir_auth)):
     """
     Cierra la sesión. Si era de un video subido, lo borra del disco.
     Si era de un demo, NO borra nada (los demos son permanentes).
@@ -361,6 +371,7 @@ def cerrar_sesion(session_id: str):
     es_demo = info.get("es_demo", False)
 
     del SESIONES[session_id]
+    RESULTADOS_STREAM.pop(session_id, None)
 
     if not es_demo:
         time.sleep(0.3)

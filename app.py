@@ -36,10 +36,12 @@ from realtime.routes import router as realtime_router
 app = FastAPI(title="Backend de Visión - Benchmark + Realtime")
 
 # CORS abierto por ahora. En producción, restringir a tu dominio de Vercel.
+# La autenticación es 100% por Bearer token, no por cookies, así que no hace
+# falta allow_credentials (y combinarlo con origin "*" no aporta nada acá).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

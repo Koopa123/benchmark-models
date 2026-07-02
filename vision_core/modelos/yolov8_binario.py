@@ -1,3 +1,4 @@
+import threading
 import time
 from collections import Counter
 from typing import Dict, List
@@ -38,6 +39,9 @@ class YOLOv8BinarioDetector(DetectorBase):
         self.nombre = nombre
         self.ruta_pesos = str(ruta_pesos)
         self.model = None
+        # self.model es un singleton compartido entre sesiones concurrentes
+        # que usen este mismo modelo: serializa el acceso a la inferencia.
+        self._lock = threading.Lock()
 
     def cargar(self):
         print(f"[{self.nombre}] Cargando...")
@@ -46,7 +50,9 @@ class YOLOv8BinarioDetector(DetectorBase):
 
     def procesar_video(self, ruta_video: str) -> Dict:
         if self.model is None:
-            self.cargar()
+            with self._lock:
+                if self.model is None:
+                    self.cargar()
 
         cap = cv2.VideoCapture(ruta_video)
         if not cap.isOpened():
@@ -64,70 +70,73 @@ class YOLOv8BinarioDetector(DetectorBase):
         frame_idx = 0
         tiempo_inicio = time.time()
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
 
-            results = self.model.predict(frame, conf=CONF_DETECCION, verbose=False)
+                with self._lock:
+                    results = self.model.predict(frame, conf=CONF_DETECCION, verbose=False)
 
-            detecciones_frame = []
-            hay_robo = False
-            if results[0].boxes is not None:
-                for box in results[0].boxes:
-                    clase_id = int(box.cls[0])
-                    if clase_id == 1:
-                        hay_robo = True
-                    detecciones_frame.append({
-                        "bbox": [float(c) for c in box.xyxy[0]],
-                        "clase": clase_id,
-                        "conf": float(box.conf[0]),
-                    })
+                detecciones_frame = []
+                hay_robo = False
+                if results[0].boxes is not None:
+                    for box in results[0].boxes:
+                        clase_id = int(box.cls[0])
+                        if clase_id == 1:
+                            hay_robo = True
+                        detecciones_frame.append({
+                            "bbox": [float(c) for c in box.xyxy[0]],
+                            "clase": clase_id,
+                            "conf": float(box.conf[0]),
+                        })
 
-            prediccion_frames.append("SHOPLIFTING" if hay_robo else "Normal")
+                prediccion_frames.append("SHOPLIFTING" if hay_robo else "Normal")
 
-            # Tracking por IoU
-            ids_asignados = set()
-            for det in detecciones_frame:
-                mejor_iou = 0.0
-                mejor_track = None
+                # Tracking por IoU
+                ids_asignados = set()
+                for det in detecciones_frame:
+                    mejor_iou = 0.0
+                    mejor_track = None
+                    for t in tracks_activos:
+                        if t["id"] in ids_asignados:
+                            continue
+                        iou_val = iou(det["bbox"], t["bbox"])
+                        if iou_val > mejor_iou and iou_val >= IOU_THRESHOLD:
+                            mejor_iou = iou_val
+                            mejor_track = t
+
+                    if mejor_track is not None:
+                        mejor_track["bbox"] = det["bbox"]
+                        mejor_track["votos"].append(det["clase"])
+                        mejor_track["confianzas"].append(det["conf"])
+                        mejor_track["frames_sin_ver"] = 0
+                        ids_asignados.add(mejor_track["id"])
+                    else:
+                        tracks_activos.append({
+                            "id": next_id,
+                            "bbox": det["bbox"],
+                            "votos": [det["clase"]],
+                            "confianzas": [det["conf"]],
+                            "frames_sin_ver": 0,
+                        })
+                        ids_asignados.add(next_id)
+                        next_id += 1
+
+                sobreviven = []
                 for t in tracks_activos:
-                    if t["id"] in ids_asignados:
-                        continue
-                    iou_val = iou(det["bbox"], t["bbox"])
-                    if iou_val > mejor_iou and iou_val >= IOU_THRESHOLD:
-                        mejor_iou = iou_val
-                        mejor_track = t
+                    if t["id"] not in ids_asignados:
+                        t["frames_sin_ver"] += 1
+                    if t["frames_sin_ver"] >= MAX_FRAMES_SIN_VER:
+                        tracks_cerrados.append(t)
+                    else:
+                        sobreviven.append(t)
+                tracks_activos = sobreviven
+        finally:
+            cap.release()
 
-                if mejor_track is not None:
-                    mejor_track["bbox"] = det["bbox"]
-                    mejor_track["votos"].append(det["clase"])
-                    mejor_track["confianzas"].append(det["conf"])
-                    mejor_track["frames_sin_ver"] = 0
-                    ids_asignados.add(mejor_track["id"])
-                else:
-                    tracks_activos.append({
-                        "id": next_id,
-                        "bbox": det["bbox"],
-                        "votos": [det["clase"]],
-                        "confianzas": [det["conf"]],
-                        "frames_sin_ver": 0,
-                    })
-                    ids_asignados.add(next_id)
-                    next_id += 1
-
-            sobreviven = []
-            for t in tracks_activos:
-                if t["id"] not in ids_asignados:
-                    t["frames_sin_ver"] += 1
-                if t["frames_sin_ver"] >= MAX_FRAMES_SIN_VER:
-                    tracks_cerrados.append(t)
-                else:
-                    sobreviven.append(t)
-            tracks_activos = sobreviven
-
-        cap.release()
         tiempo_total = time.time() - tiempo_inicio
         todos = tracks_activos + tracks_cerrados
 

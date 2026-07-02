@@ -6,6 +6,8 @@ uvicorn[standard]
 python-multipart
 pydantic
 websockets
+python-jose[cryptography]
+python-dotenv
 
 # ============================================================
 # Visión por computadora
